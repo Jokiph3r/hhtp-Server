@@ -7,24 +7,26 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
 
 const maxConnections = 10
 
-// MIME types
-var mimeTypes = map[string]string{
-	".html": "text/html",
-	".txt":  "text/plain",
-	".gif":  "image/gif",
-	".jpeg": "image/jpeg",
-	".jpg":  "image/jpeg",
-	".css":  "text/css",
-}
-
 var connCount = 0
 var connLock sync.Mutex
+
+var supportedFileTypes = map[string]bool{
+	".html": true,
+	".txt":  true,
+	".gif":  true,
+	".jpeg": true,
+	".jpg":  true,
+	".css":  true,
+}
+
+
 
 func main() {
 	if len(os.Args) != 2 {
@@ -63,31 +65,44 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
 	defer func() {
+		conn.Close() // Ensure the connection is always closed
 		connLock.Lock()
 		connCount--
 		connLock.Unlock()
 	}()
 
 	reader := bufio.NewReader(conn)
+
+	// Read the HTTP request line
 	requestLine, err := reader.ReadString('\n')
 	if err != nil {
 		httpError(conn, 400, "Bad Request")
 		return
 	}
 
+	// Parse the HTTP request line
 	method, path, valid := parseRequestLine(requestLine)
 	if !valid {
 		httpError(conn, 400, "Bad Request")
 		return
 	}
 
+	// Parse headers for POST requests
+	var contentLength int = -1
+	if method == "POST" {
+		contentLength = parseHeaders(reader)
+		if contentLength < 0 {
+			httpError(conn, 411, "Length Required")
+			return
+		}
+	}
+	// Route the request
 	switch method {
 	case "GET":
 		handleGet(conn, path)
 	case "POST":
-		handlePost(conn, path, reader)
+		handlePost(conn, path, reader, contentLength)
 	default:
 		httpError(conn, 501, "Not Implemented")
 	}
@@ -101,15 +116,37 @@ func parseRequestLine(line string) (string, string, bool) {
 	return parts[0], parts[1], true
 }
 
+func parseHeaders(reader *bufio.Reader) int {
+	var contentLength int = -1
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			break
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			if strings.ToLower(key) == "content-length" {
+				contentLength, _ = strconv.Atoi(value)
+			}
+		}
+	}
+	return contentLength
+}
+
 func handleGet(conn net.Conn, path string) {
 	filePath := filepath.Join("files", path)
 	ext := filepath.Ext(filePath)
-	contentType, supported := mimeTypes[ext]
-	if !supported {
-		httpError(conn, 400, "Bad Request")
+
+	// Validate file type
+	if !supportedFileTypes[ext] {
+		httpError(conn, 400, "Bad Request: Unsupported file type")
 		return
 	}
 
+	// Open and read the file
 	file, err := os.Open(filePath)
 	if err != nil {
 		httpError(conn, 404, "Not Found")
@@ -118,13 +155,18 @@ func handleGet(conn net.Conn, path string) {
 	defer file.Close()
 
 	conn.Write([]byte("HTTP/1.1 200 OK\r\n"))
-	conn.Write([]byte("Content-Type: " + contentType + "\r\n\r\n"))
-
+	conn.Write([]byte("Content-Type: text/plain\r\n"))
+	conn.Write([]byte("Connection: close\r\n\r\n"))
 	io.Copy(conn, file)
+
+	conn.Close() // Immediately close the connection after response
+	fmt.Println("GET request handled. Connection closed.")
 }
 
-func handlePost(conn net.Conn, path string, reader *bufio.Reader) {
+func handlePost(conn net.Conn, path string, reader *bufio.Reader, contentLength int) {
 	filePath := filepath.Join("files", path)
+
+	// Create or overwrite the file
 	file, err := os.Create(filePath)
 	if err != nil {
 		httpError(conn, 500, "Internal Server Error")
@@ -132,22 +174,25 @@ func handlePost(conn net.Conn, path string, reader *bufio.Reader) {
 	}
 	defer file.Close()
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil || line == "\r\n" {
-			break
-		}
-	}
-
-	_, err = io.Copy(file, reader)
+	// Read the exact number of bytes from the body
+	_, err = io.CopyN(file, reader, int64(contentLength))
 	if err != nil {
 		httpError(conn, 500, "Internal Server Error")
 		return
 	}
 
-	conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	// Send the response
+	conn.Write([]byte("HTTP/1.1 200 OK\r\n"))
+	conn.Write([]byte("Content-Type: text/plain\r\n"))
+	conn.Write([]byte("Connection: close\r\n\r\n"))
+
+	conn.Close() // Forcefully close the connection
+	fmt.Println("POST request handled. Connection closed.")
 }
 
 func httpError(conn net.Conn, status int, message string) {
-	conn.Write([]byte(fmt.Sprintf("HTTP/1.1 %d %s\r\n\r\n", status, message)))
+	conn.Write([]byte(fmt.Sprintf("HTTP/1.1 %d %s\r\n", status, message)))
+	conn.Write([]byte("Connection: close\r\n\r\n"))
+	conn.Close() // Ensure connection is closed even in case of errors
+	fmt.Printf("Error %d: %s. Connection closed.\n", status, message)
 }
